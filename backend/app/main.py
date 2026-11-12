@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from . import db, token as tok
 from .policy_engine import build_receipt, evaluate_transaction, norm_merchant
+from .redteam import run_redteam
 from .schemas import Decision, PurchaseIntent, TransactionProposal
 from .services import agent
 from .services.intent_parser import ParseError, parse_instruction
@@ -57,6 +58,7 @@ class DemoBody(BaseModel):
     request_id: str
     scenario: str
     protected: bool = True
+    agent: str = "scripted"  # "scripted" or "llm" (real OpenAI agent, falls back if no key)
 
 
 @app.get("/health")
@@ -216,14 +218,21 @@ def scenarios():
     return agent.SCENARIO_LABELS
 
 
+@app.get("/demo/redteam")
+def redteam():
+    """Live scoreboard: runs every built-in attack through the real policy engine."""
+    return run_redteam()
+
+
 @app.post("/demo/agent")
 def demo_agent(b: DemoBody):
     if b.scenario not in agent.DEMO_PAGES:
         raise HTTPException(404, "unknown scenario")
-    _load_intent(b.request_id)
-    p = agent.propose(agent.DEMO_PAGES[b.scenario], b.request_id)
+    intent = _load_intent(b.request_id)
+    p, used, note = agent.propose_auto(agent.DEMO_PAGES[b.scenario], b.request_id, intent.raw_user_request, b.agent)
+    info = {"agent": used, "agent_note": note}
     if b.protected:
-        return {"mode": "PROTECTED", "proposal": p.model_dump(mode="json"), **evaluate(p)}
+        return {"mode": "PROTECTED", **info, "proposal": p.model_dump(mode="json"), **evaluate(p)}
     # UNPROTECTED demo path: what a naive agent would do. Deliberately bypasses the gate; demo only.
     try:
         o = get_paypal().create_order(p.proposal_id, norm_merchant(p.merchant_name), p.product_name,
@@ -231,5 +240,5 @@ def demo_agent(b: DemoBody):
     except PayPalError as e:
         raise HTTPException(502, str(e))
     db.audit(p.proposal_id, "UNPROTECTED_demo_order", {"order_id": o["id"], "total": str(p.total_amount)})
-    return {"mode": "UNPROTECTED", "proposal": p.model_dump(mode="json"), "paypal_order": o,
+    return {"mode": "UNPROTECTED", **info, "proposal": p.model_dump(mode="json"), "paypal_order": o,
             "note": "No authorization check. The agent's hijacked purchase went straight to PayPal."}
